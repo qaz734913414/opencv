@@ -92,6 +92,7 @@ class LSTMLayerImpl CV_FINAL : public LSTMLayer
     bool produceCellOutput;
     float forgetBias, cellClip;
     bool useCellClip, usePeephole;
+    bool reverse;   // If true, go in negative direction along the time axis
 
 public:
 
@@ -119,9 +120,10 @@ public:
             if (blobs.size() > 3)
             {
                 CV_Assert(blobs.size() == 6);
+                const int N = Wh.cols;
                 for (int i = 3; i < 6; ++i)
                 {
-                    CV_Assert(blobs[i].rows == Wh.cols && blobs[i].cols == Wh.cols);
+                    CV_Assert(blobs[i].rows == N && blobs[i].cols == N);
                     CV_Assert(blobs[i].type() == bias.type());
                 }
             }
@@ -132,6 +134,7 @@ public:
         cellClip = params.get<float>("cell_clip", 0.0f);
         useCellClip = params.get<bool>("use_cell_clip", false);
         usePeephole = params.get<bool>("use_peephole", false);
+        reverse = params.get<bool>("reverse", false);
 
         allocated = false;
         outTailShape.clear();
@@ -174,7 +177,7 @@ public:
                          std::vector<MatShape> &outputs,
                          std::vector<MatShape> &internals) const CV_OVERRIDE
     {
-        CV_Assert(!usePeephole && blobs.size() == 3 || usePeephole && blobs.size() == 6);
+        CV_Assert((!usePeephole && blobs.size() == 3) || (usePeephole && blobs.size() == 6));
         CV_Assert(inputs.size() == 1);
         const MatShape& inp0 = inputs[0];
 
@@ -188,18 +191,16 @@ public:
         else
             outTailShape_.assign(1, _numOut);
 
-        int _numTimeStamps, _numSamples;
+        int _numSamples;
         if (useTimestampDim)
         {
             CV_Assert(inp0.size() >= 2 && total(inp0, 2) == _numInp);
-            _numTimeStamps = inp0[0];
             _numSamples = inp0[1];
-            outResShape.push_back(_numTimeStamps);
+            outResShape.push_back(inp0[0]);
         }
         else
         {
             CV_Assert(inp0.size() >= 2 && total(inp0, 1) == _numInp);
-            _numTimeStamps = 1;
             _numSamples = inp0[0];
         }
 
@@ -217,11 +218,14 @@ public:
         return false;
     }
 
-    void finalize(const std::vector<Mat*> &input, std::vector<Mat> &output) CV_OVERRIDE
+    void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays) CV_OVERRIDE
     {
-        CV_Assert(!usePeephole && blobs.size() == 3 || usePeephole && blobs.size() == 6);
+        std::vector<Mat> input;
+        inputs_arr.getMatVector(input);
+
+        CV_Assert((!usePeephole && blobs.size() == 3) || (usePeephole && blobs.size() == 6));
         CV_Assert(input.size() == 1);
-        const Mat& inp0 = *input[0];
+        const Mat& inp0 = input[0];
 
         Mat &Wh = blobs[0], &Wx = blobs[1];
         int numOut = Wh.size[1];
@@ -257,13 +261,16 @@ public:
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
-        Layer::forward_fallback(inputs_arr, outputs_arr, internals_arr);
-    }
+        if (inputs_arr.depth() == CV_16S)
+        {
+            forward_fallback(inputs_arr, outputs_arr, internals_arr);
+            return;
+        }
 
-    void forward(std::vector<Mat*> &input, std::vector<Mat> &output, std::vector<Mat> &internals) CV_OVERRIDE
-    {
-        CV_TRACE_FUNCTION();
-        CV_TRACE_ARG_VALUE(name, "name", name.c_str());
+        std::vector<Mat> input, output, internals;
+        inputs_arr.getMatVector(input);
+        outputs_arr.getMatVector(output);
+        internals_arr.getMatVector(internals);
 
         const Mat &Wh = blobs[0];
         const Mat &Wx = blobs[1];
@@ -278,12 +285,23 @@ public:
         dummyOnes.setTo(1.);
 
         int numSamplesTotal = numTimeStamps*numSamples;
-        Mat xTs = input[0]->reshape(1, numSamplesTotal);
+        Mat xTs = input[0].reshape(1, numSamplesTotal);
 
         Mat hOutTs = output[0].reshape(1, numSamplesTotal);
         Mat cOutTs = produceCellOutput ? output[1].reshape(1, numSamplesTotal) : Mat();
 
-        for (int ts = 0; ts < numTimeStamps; ts++)
+        int tsStart, tsEnd, tsInc;
+        if (reverse) {
+            tsStart = numTimeStamps - 1;
+            tsEnd = -1;
+            tsInc = -1;
+        }
+        else {
+            tsStart = 0;
+            tsEnd = numTimeStamps;
+            tsInc = 1;
+        }
+        for (int ts = tsStart; ts != tsEnd; ts += tsInc)
         {
             Range curRowRange(ts*numSamples, (ts + 1)*numSamples);
             Mat xCurr = xTs.rowRange(curRowRange);
@@ -350,16 +368,16 @@ Ptr<LSTMLayer> LSTMLayer::create(const LayerParams& params)
 
 int LSTMLayer::inputNameToIndex(String inputName)
 {
-    if (inputName.toLowerCase() == "x")
+    if (toLowerCase(inputName) == "x")
         return 0;
     return -1;
 }
 
 int LSTMLayer::outputNameToIndex(const String& outputName)
 {
-    if (outputName.toLowerCase() == "h")
+    if (toLowerCase(outputName) == "h")
         return 0;
-    else if (outputName.toLowerCase() == "c")
+    else if (toLowerCase(outputName) == "c")
         return 1;
     return -1;
 }
@@ -433,8 +451,11 @@ public:
         return false;
     }
 
-    void finalize(const std::vector<Mat*> &input, std::vector<Mat> &output) CV_OVERRIDE
+    void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays) CV_OVERRIDE
     {
+        std::vector<Mat> input, outputs;
+        inputs_arr.getMatVector(input);
+
         CV_Assert(input.size() >= 1 && input.size() <= 2);
 
         Wxh = blobs[0];
@@ -447,7 +468,7 @@ public:
         numX = Wxh.cols;
         numO = Who.rows;
 
-        const Mat& inp0 = *input[0];
+        const Mat& inp0 = input[0];
 
         CV_Assert(inp0.dims >= 2);
         CV_Assert(inp0.total(2) == numX);
@@ -478,15 +499,18 @@ public:
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
-        Layer::forward_fallback(inputs_arr, outputs_arr, internals_arr);
-    }
+        if (inputs_arr.depth() == CV_16S)
+        {
+            forward_fallback(inputs_arr, outputs_arr, internals_arr);
+            return;
+        }
 
-    void forward(std::vector<Mat*> &input, std::vector<Mat> &output, std::vector<Mat> &internals) CV_OVERRIDE
-    {
-        CV_TRACE_FUNCTION();
-        CV_TRACE_ARG_VALUE(name, "name", name.c_str());
+        std::vector<Mat> input, output, internals;
+        inputs_arr.getMatVector(input);
+        outputs_arr.getMatVector(output);
+        internals_arr.getMatVector(internals);
 
-        Mat xTs = input[0]->reshape(1, numSamplesTotal);
+        Mat xTs = input[0].reshape(1, numSamplesTotal);
         Mat oTs = output[0].reshape(1, numSamplesTotal);
         Mat hTs = produceH ? output[1].reshape(1, numSamplesTotal) : Mat();
         Mat hCurr = internals[0];
